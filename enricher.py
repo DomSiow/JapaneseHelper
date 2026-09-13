@@ -1,83 +1,87 @@
 import pandas as pd
 import requests
-import time
-from tokenizer import extract_vocabulary
-from analyzer import rank_vocabulary
+import urllib.parse
+from bs4 import BeautifulSoup
+from concurrent.futures import ThreadPoolExecutor
 
-def get_jisho_data(word: str) -> tuple:
-    """
-    Sends a request to the Jisho.org API and returns 
-    the pronunciation (reading) and English definition.
-    """
-    url = f"https://jisho.org/api/v1/search/words?keyword={word}"
+session = requests.Session()
+session.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "text/html,application/json"
+})
+
+def fetch_jisho_definition(term: str) -> tuple:
+    """Queries Jisho's API, falling back to direct HTML scraping if necessary."""
+    clean_term = term.strip()
+    api_url = f"https://jisho.org/api/v1/search/words?keyword={urllib.parse.quote(clean_term)}"
+    jisho_link = f"https://jisho.org/search/{urllib.parse.quote(clean_term)}"
     
     try:
-        response = requests.get(url, timeout=5)
-        data = response.json()
-        
-        if data['data']:
-            # Grab the very first (most common) search result
-            first_result = data['data'][0]
-            japanese_info = first_result['japanese'][0]
-            
-            # 1. Extract the reading (furigana)
-            reading = japanese_info.get('reading', '')
-            
-            # 2. Extract the first English definition
-            senses = first_result.get('senses', [])
-            if senses:
-                english_defs = senses[0].get('english_definitions', [])
-                definition = ", ".join(english_defs)
-            else:
-                definition = "No definition found"
-                
-            return reading, definition
-            
-    except Exception as e:
-        print(f"Error fetching {word}: {e}")
-        
-    return "", "Not found"
+        # 1. Try JSON API first
+        response = session.get(api_url, timeout=3)
+        if response.status_code == 200:
+            data = response.json().get("data", [])
+            if data:
+                first = data[0]
+                reading = clean_term
+                japanese_array = first.get("japanese", [])
+                if japanese_array:
+                    reading = japanese_array[0].get("reading", japanese_array[0].get("word", clean_term))
+                    
+                defs = None
+                pos = "Vocabulary"
+                senses = first.get("senses", [])
+                if senses:
+                    for sense in senses:
+                        english_defs = sense.get("english_definitions", [])
+                        if english_defs:
+                            defs = "; ".join(english_defs)
+                            break
+                    parts = senses[0].get("parts_of_speech", [])
+                    if parts:
+                        pos = ", ".join(parts)
+                        
+                if defs:
+                    return clean_term, reading, pos, defs, jisho_link
 
-def enrich_vocabulary(df_vocab: pd.DataFrame, top_n: int = 5) -> pd.DataFrame:
-    """
-    Takes the ranked vocabulary, slices the top N words, 
-    and adds dictionary definitions and readings via API.
-    """
-    # Slice the top N words so we don't spam the API with 1000 requests
-    df_top = df_vocab.head(top_n).copy()
-    
-    readings = []
-    definitions = []
-    
-    print(f"Fetching dictionary data for the top {top_n} words...")
-    
-    for lemma in df_top['lemma']:
-        reading, definition = get_jisho_data(lemma)
-        readings.append(reading)
-        definitions.append(definition)
-        
-        # Be polite to the API server! Pause for half a second between requests.
-        time.sleep(0.5) 
-        
-    # Add our new data as columns to the scoreboard
-    df_top['reading'] = readings
-    df_top['definition'] = definitions
-    
-    # Reorder columns to make it look like a study sheet
-    columns_order = ['lemma', 'reading', 'definition', 'pos', 'specificity_score']
-    return df_top[columns_order]
+        # 2. Fallback: Scrape Jisho's web page directly
+        html_response = session.get(jisho_link, timeout=3)
+        if html_response.status_code == 200:
+            soup = BeautifulSoup(html_response.text, 'html.parser')
+            
+            furigana_el = soup.find('span', class_='furigana')
+            reading = furigana_el.text.strip() if furigana_el else clean_term
+            
+            meaning_el = soup.find('span', class_='meaning-meaning')
+            if meaning_el:
+                defs = meaning_el.text.strip()
+                pos_el = soup.find('span', class_='part-of-speech')
+                pos = pos_el.text.strip() if pos_el else "Vocabulary"
+                return clean_term, reading, pos, defs, jisho_link
 
-# --- Quick Test ---
-if __name__ == "__main__":
-    sample_lyrics = "走り出すバスの窓から、君の姿が見えた。君は走っていた。私は泣いた。"
+    except Exception:
+        pass
+            
+    return clean_term, clean_term, "Vocabulary", "See Jisho entry", jisho_link
+
+def _lookup_single_word(term: str) -> dict:
+    term, reading, pos, definition, jisho_link = fetch_jisho_definition(term)
+    return {
+        "term": term,
+        "reading": reading,
+        "part_of_speech": pos,
+        "definition": definition,
+        "jisho_link": jisho_link,
+    }
+
+def enrich_vocabulary(df_vocab: pd.DataFrame, line: str = "", top_n: int = 20) -> pd.DataFrame:
+    """Enriches vocabulary concurrently using Jisho API + HTML fallback."""
+    if df_vocab.empty:
+        return pd.DataFrame()
+
+    top_terms = df_vocab.head(top_n)["lemma"].tolist()
     
-    # Run the full pipeline!
-    df_raw = extract_vocabulary(sample_lyrics)
-    df_ranked = rank_vocabulary(df_raw)
-    
-    # Enrich the top 3 most important words
-    df_final = enrich_vocabulary(df_ranked, top_n=3)
-    
-    print("\nFinal Enriched Study Sheet:")
-    print("-" * 70)
-    print(df_final)
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(_lookup_single_word, top_terms))
+        
+    return pd.DataFrame(results)

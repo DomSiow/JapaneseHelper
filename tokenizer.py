@@ -20,7 +20,6 @@ def extract_vocabulary(text: str) -> pd.DataFrame:
     for t in tokens:
         pos = t.part_of_speech()[0]
         # Filter out punctuation, basic particles, and auxiliary verbs 
-        # to focus on core nouns, verbs, and adjectives.
         if pos not in ["助詞", "補助記号", "助動詞", "空白"]:
             vocab_list.append({
                 "surface": t.surface(),

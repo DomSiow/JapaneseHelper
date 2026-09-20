@@ -17,7 +17,6 @@ def fetch_jisho_definition(term: str) -> tuple:
     jisho_link = f"https://jisho.org/search/{urllib.parse.quote(clean_term)}"
     
     try:
-        # 1. Try JSON API first
         response = session.get(api_url, timeout=3)
         if response.status_code == 200:
             data = response.json().get("data", [])
@@ -44,7 +43,6 @@ def fetch_jisho_definition(term: str) -> tuple:
                 if defs:
                     return clean_term, reading, pos, defs, jisho_link
 
-        # 2. Fallback: Scrape Jisho's web page directly
         html_response = session.get(jisho_link, timeout=3)
         if html_response.status_code == 200:
             soup = BeautifulSoup(html_response.text, 'html.parser')
@@ -64,10 +62,11 @@ def fetch_jisho_definition(term: str) -> tuple:
             
     return clean_term, clean_term, "Vocabulary", "See Jisho entry", jisho_link
 
-def _lookup_single_word(term: str) -> dict:
-    term, reading, pos, definition, jisho_link = fetch_jisho_definition(term)
+def _lookup_single_word(task: dict) -> dict:
+    term_lemma = task["lemma"]
+    term_clean, reading, pos, definition, jisho_link = fetch_jisho_definition(term_lemma)
     return {
-        "term": term,
+        "term": term_clean,
         "reading": reading,
         "part_of_speech": pos,
         "definition": definition,
@@ -75,13 +74,13 @@ def _lookup_single_word(term: str) -> dict:
     }
 
 def enrich_vocabulary(df_vocab: pd.DataFrame, line: str = "", top_n: int = 20) -> pd.DataFrame:
-    """Enriches vocabulary concurrently using Jisho API + HTML fallback."""
+    """Enriches vocabulary concurrently using Jisho."""
     if df_vocab.empty:
         return pd.DataFrame()
 
-    top_terms = df_vocab.head(top_n)["lemma"].tolist()
+    tasks = df_vocab.head(top_n)[["lemma", "surface"]].to_dict("records")
     
     with ThreadPoolExecutor(max_workers=8) as executor:
-        results = list(executor.map(_lookup_single_word, top_terms))
+        results = list(executor.map(_lookup_single_word, tasks))
         
     return pd.DataFrame(results)
